@@ -14,7 +14,7 @@
     "url": "git+https://github.com/mcdexio/leverage-token.git"
   },
   "author": "",
-  "license": "GPL-2.0",
+  "license": "GPL-3.0-or-later",
   "bugs": {
     "url": "https://github.com/mcdexio/leverage-token/issues"
   },
