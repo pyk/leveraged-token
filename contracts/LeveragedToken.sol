@@ -7,12 +7,13 @@ import "@openzeppelin/contracts/utils/SafeCast.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import "./interfaces/ILiquidityPool.sol";
-
+import "./Controller.sol";
 import "./ILeveragedToken.sol";
 
-contract LeveragedToken is ILeveragedToken, ERC20 {
+contract LeveragedToken is ILeveragedToken, ERC20, ReentrancyGuard {
     using SignedSafeMath for int256;
     using SafeMath for uint256;
     using SafeCast for uint256;
@@ -23,22 +24,13 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
     int256 public constant EXP_SCALE = 10**18;
     uint256 public constant UEXP_SCALE = 10**18;
 
-    // If the leverage >= targetLeverage * 33.3%, we can rebalance
-    uint256 public constant EMERGENCY_REBALENCE_THRESHOLD = (UEXP_SCALE * 333) / 1000;
+    // assume block time is 13.3s
+    uint256 public constant PERIODIC_REBALANCE_MIN_INTERVAL_BLOCKS = (uint256(12 hours) * 10) / 133;
 
-    uint256 public constant REBALANCE_PRECEISON = (UEXP_SCALE * 5) / 100;
-
-    // If now >= last RebalanceTime + REBALANCE_INTERVAL, we can rebalance
-    uint256 public constant PERIODIC_REBALANCE_INTERVAL_BLOCKS = (uint256(1 days) * 10) / 133;
-
-    // rabalance slippage tolerance is 0.3%
-    int256 public constant REBALANCE_SLIPPAGE_TOLERANCE = (EXP_SCALE * 3) / 1000;
-
-    // rebalance fee is 0.05%, the fee is for keeper
-    int256 public constant REBALANCE_FEE = (EXP_SCALE * 1) / 2000;
+    Controller public controller;
 
     // address of Mai3 liquidity pool
-    address public liquidityPool;
+    ILiquidityPool public pool;
 
     // pereptual index in the liquidity pool
     uint256 public perpetualIndex;
@@ -53,13 +45,17 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
 
     bool public isSettled;
 
-    bool public isEmergency;
-
     event BuyTokens(address indexed buyer, uint256 amount, uint256 cost);
 
     event SellTokens(address indexed seller, uint256 amount, uint256 income);
 
     event Settle(address indexed account, uint256 amount, uint256 collaterals);
+
+    modifier onlyKeeper {
+        address keeper = controller.keeper();
+        require(keeper == address(0) || msg.sender == keeper, "only Keeper");
+        _;
+    }
 
     constructor(
         string memory name_,
@@ -67,37 +63,36 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         address liquidityPool_,
         uint256 perpetualIndex_,
         uint256 targetLeverage_,
-        bool isLongToken_
+        bool isLongToken_,
+        address controller_
     ) ERC20(name_, symbol_) {
-        require(targetLeverage_ > 0, "target leverage <= 0");
-
-        liquidityPool = liquidityPool_;
+        pool = ILiquidityPool(liquidityPool_);
         perpetualIndex = perpetualIndex_;
         targetLeverage = targetLeverage_;
         isLongToken = isLongToken_;
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         (bool isRunning, , address[7] memory addresses, , uint256[4] memory uintNums) =
             pool.getLiquidityPoolInfo();
         require(isRunning, "pool is not running");
         collateralToken = addresses[5];
         collateralDecimals = uintNums[0];
         isSettled = false;
+        controller = Controller(controller_);
+        require(targetLeverage <= controller.maxTargetLeverage(), "invalid leverage");
 
         updateAllowances();
     }
 
     function updateAllowances() public {
-        uint256 allowance = IERC20(collateralToken).allowance(address(this), liquidityPool);
-        IERC20(collateralToken).safeIncreaseAllowance(liquidityPool, MAX_UINT256.sub(allowance));
+        uint256 allowance = IERC20(collateralToken).allowance(address(this), address(pool));
+        IERC20(collateralToken).safeIncreaseAllowance(address(pool), MAX_UINT256.sub(allowance));
     }
 
     function buy(
         uint256 amount,
         uint256 limitPrice,
         uint256 deadline
-    ) external override {
+    ) external override nonReentrant {
         require(!isSettled, "settled");
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         pool.forceToSyncState();
 
         (int256 cost, int256 tradeAmount, int256 tradePrice) = _buyCost(amount.toInt256());
@@ -120,7 +115,6 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
 
     function buyCost(uint256 amount) external override returns (uint256 cost) {
         require(!isSettled, "settled");
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         pool.forceToSyncState();
 
         (int256 c, , ) = _buyCost(amount.toInt256());
@@ -142,7 +136,6 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         )
     {
         int256 markPrice;
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         {
             (PerpetualState state, , int256[39] memory nums) =
                 pool.getPerpetualInfo(perpetualIndex);
@@ -195,13 +188,9 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         uint256 amount,
         uint256 limitPrice,
         uint256 deadline
-    ) external override {
+    ) external override nonReentrant {
         require(!isSettled, "settled");
-        //anti re-entry
-        _burn(msg.sender, amount);
 
-        ILiquidityPool(liquidityPool).forceToSyncState();
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         pool.forceToSyncState();
 
         (int256 income, int256 tradeAmount, int256 tradePrice) = _sellIncome(amount.toInt256());
@@ -212,13 +201,13 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
 
         uint256 collateralAmount = _collateralTokens(income);
         IERC20(collateralToken).transferFrom(address(this), msg.sender, collateralAmount);
+        _burn(msg.sender, amount);
 
         emit SellTokens(msg.sender, amount, realIncome);
     }
 
     function sellIncome(uint256 amount) external override returns (uint256 income) {
         require(!isSettled, "settled");
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         pool.forceToSyncState();
 
         (int256 i, , ) = _sellIncome(amount.toInt256());
@@ -240,7 +229,6 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         )
     {
         int256 markPrice;
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         {
             (PerpetualState state, , int256[39] memory nums) =
                 pool.getPerpetualInfo(perpetualIndex);
@@ -280,7 +268,6 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
     }
 
     function netAssetValue() external override returns (uint256) {
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         pool.forceToSyncState();
 
         uint256 totalSupply = totalSupply();
@@ -303,7 +290,6 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
 
     function settle() external override {
         if (!isSettled) {
-            ILiquidityPool pool = ILiquidityPool(liquidityPool);
             pool.forceToSyncState();
             pool.settle(perpetualIndex, address(this));
             isSettled = true;
@@ -320,15 +306,18 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         emit Settle(msg.sender, amount, collaterals);
     }
 
-    function perdiocalRebalance(int256 tradeAmount, uint256 deadline) external {
+    function perdiocalRebalance(int256 tradeAmount, uint256 deadline)
+        external
+        onlyKeeper
+        nonReentrant
+    {
         require(!isSettled, "settled");
-        require(!isEmergency, "emergency");
         require(
-            lastPeriodicRebalanceBlock + PERIODIC_REBALANCE_INTERVAL_BLOCKS < block.number,
+            lastPeriodicRebalanceBlock + PERIODIC_REBALANCE_MIN_INTERVAL_BLOCKS < block.number,
             "too early"
         );
+        require(block.timestamp % (1 days) < controller.maxRebalanceTime(), "bad time");
 
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         pool.forceToSyncState();
 
         int256 markPrice = _getMarkPrice();
@@ -356,9 +345,12 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         }
     }
 
-    function emergencyRebalance(int256 tradeAmount, uint256 deadline) external {
+    function emergencyRebalance(int256 tradeAmount, uint256 deadline)
+        external
+        onlyKeeper
+        nonReentrant
+    {
         require(!isSettled, "settled");
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         pool.forceToSyncState();
 
         int256 markPrice = _getMarkPrice();
@@ -367,23 +359,8 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         uint256 leverage = _leverage(markPrice, margin, position);
 
         uint256 emergencyLeverageCeil = _emergencyLeverageCeil();
-        if (leverage >= emergencyLeverageCeil) {
-            isEmergency = true;
-        } else {
-            require(isEmergency, "not emergency");
-        }
-
-        uint256 leverageCeil = _targetLeverageCeil();
-
-        if (leverage <= leverageCeil) {
-            isEmergency = false;
-        } else {
-            uint256 newLeverage =
-                _decreaseLeverage(markPrice, position, leverage, tradeAmount, deadline);
-            if (newLeverage <= leverageCeil) {
-                isEmergency = false;
-            }
-        }
+        require(leverage >= emergencyLeverageCeil, "not emergency");
+        _decreaseLeverage(markPrice, position, leverage, tradeAmount, deadline);
     }
 
     function _decreaseLeverage(
@@ -393,7 +370,6 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         int256 tradeAmount,
         uint256 deadline
     ) internal returns (uint256 newLeverage) {
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         require(
             (position > 0 && tradeAmount > 0) || (position < 0 && tradeAmount < 0),
             "bad trade side"
@@ -427,7 +403,6 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
         int256 tradeAmount,
         uint256 deadline
     ) internal returns (uint256 newLeverage) {
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         require(
             (position > 0 && tradeAmount < 0) || (position < 0 && tradeAmount > 0),
             "bad trade side"
@@ -467,14 +442,12 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
     }
 
     function _getMarkPrice() internal view returns (int256) {
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         (PerpetualState state, , int256[39] memory nums) = pool.getPerpetualInfo(perpetualIndex);
         require(state == PerpetualState.NORMAL, "perp not noraml");
         return nums[1];
     }
 
     function _getPosition() internal view returns (int256 margin, int256 position) {
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         bool isMarginSafe;
         (, position, , margin, , , , isMarginSafe, ) = pool.getMarginAccount(
             perpetualIndex,
@@ -490,36 +463,40 @@ contract LeveragedToken is ILeveragedToken, ERC20 {
     }
 
     function _targetLeverageCeil() internal view returns (uint256) {
-        return targetLeverage.mul(UEXP_SCALE + REBALANCE_PRECEISON).div(UEXP_SCALE);
+        return targetLeverage.mul(UEXP_SCALE + controller.rebalancePrecision()).div(UEXP_SCALE);
     }
 
     function _targetLeverageFloor() internal view returns (uint256) {
-        return targetLeverage.mul(UEXP_SCALE - REBALANCE_PRECEISON).div(UEXP_SCALE);
+        return targetLeverage.mul(UEXP_SCALE - controller.rebalancePrecision()).div(UEXP_SCALE);
     }
 
     function _rebalanceLimitPrice(int256 tradeAmount, int256 markPrice)
         internal
-        pure
+        view
         returns (int256 limitPrice)
     {
         if (tradeAmount > 0) {
-            limitPrice = markPrice.mul(EXP_SCALE + REBALANCE_SLIPPAGE_TOLERANCE).div(EXP_SCALE);
+            limitPrice = markPrice.mul(EXP_SCALE + controller.rebalanceSlippageTolerance()).div(
+                EXP_SCALE
+            );
         } else {
-            limitPrice = markPrice.mul(EXP_SCALE - REBALANCE_SLIPPAGE_TOLERANCE).div(EXP_SCALE);
+            limitPrice = markPrice.mul(EXP_SCALE - controller.rebalanceSlippageTolerance()).div(
+                EXP_SCALE
+            );
         }
     }
 
     function _emergencyLeverageCeil() internal view returns (uint256) {
-        return targetLeverage.mul(UEXP_SCALE + REBALANCE_PRECEISON).div(UEXP_SCALE);
+        return targetLeverage.mul(UEXP_SCALE + controller.rebalancePrecision()).div(UEXP_SCALE);
     }
 
     function _sendRebalanceFee(int256 markPrice, int256 tradeAmount) internal {
-        ILiquidityPool pool = ILiquidityPool(liquidityPool);
         if (tradeAmount < 0) {
             tradeAmount = -tradeAmount;
         }
-        int256 fee = markPrice.mul(tradeAmount).div(EXP_SCALE).mul(REBALANCE_FEE).div(EXP_SCALE);
-        pool.withdraw(perpetualIndex, address(this), fee);
-        IERC20(collateralToken).transfer(msg.sender, fee.toUint256());
+        int256 feeBase = markPrice.mul(tradeAmount).div(EXP_SCALE);
+        int256 keeperFee = feeBase.mul(controller.rebalanceKeeperFee()).div(EXP_SCALE);
+        pool.withdraw(perpetualIndex, address(this), keeperFee);
+        IERC20(collateralToken).transfer(msg.sender, keeperFee.toUint256());
     }
 }

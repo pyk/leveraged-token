@@ -3,23 +3,35 @@ pragma solidity ^0.7.4;
 pragma experimental ABIEncoderV2;
 
 import "./interfaces/ILiquidityPool.sol";
-
+import "./Controller.sol";
 import "./LeveragedToken.sol";
 
 contract LeveragedTokenFactory {
     uint256 public constant UEXP_SCALE = 10**18;
+    address public defaultController;
 
     mapping(bytes32 => address) public tokens;
 
-    constructor() {}
-
-    event CreateLeverageToken(
+    event CreateLeveragedToken(
         address liquidityPool_,
         uint256 perpetualIndex_,
         uint256 targetLeverage_,
         bool isLongToken_,
         address token
     );
+
+    modifier onlyDao {
+        require(msg.sender == Controller(defaultController).dao(), "only dao");
+        _;
+    }
+
+    constructor(address controller) {
+        defaultController = controller;
+    }
+
+    function setDefaultController(address controller) public onlyDao {
+        defaultController = controller;
+    }
 
     function createLeverageToken(
         address liquidityPool_,
@@ -55,10 +67,11 @@ contract LeveragedTokenFactory {
                 liquidityPool_,
                 perpetualIndex_,
                 targetLeverage_,
-                isLongToken_
+                isLongToken_,
+                defaultController
             );
         tokens[nameHash] = address(token);
-        emit CreateLeverageToken(
+        emit CreateLeveragedToken(
             liquidityPool_,
             perpetualIndex_,
             targetLeverage_,
