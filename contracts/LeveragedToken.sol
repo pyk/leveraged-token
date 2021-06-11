@@ -358,9 +358,12 @@ contract LeveragedToken is ILeveragedToken, ERC20, ReentrancyGuard {
         (int256 margin, int256 position) = _getPosition();
         uint256 leverage = _leverage(markPrice, margin, position);
 
-        uint256 emergencyLeverageCeil = _emergencyLeverageCeil();
-        require(leverage >= emergencyLeverageCeil, "not emergency");
-        _decreaseLeverage(markPrice, position, leverage, tradeAmount, deadline);
+        uint256 emergencyLeverage = _emergencyLeverage();
+        require(leverage >= emergencyLeverage, "not emergency");
+        uint256 newLeverage =
+            _decreaseLeverage(markPrice, position, leverage, tradeAmount, deadline);
+        uint256 emergencyMinLeverage = _emergencyMinLeverage();
+        require(newLeverage >= emergencyMinLeverage, "leverage too small");
     }
 
     function _decreaseLeverage(
@@ -486,8 +489,12 @@ contract LeveragedToken is ILeveragedToken, ERC20, ReentrancyGuard {
         }
     }
 
-    function _emergencyLeverageCeil() internal view returns (uint256) {
-        return targetLeverage.mul(UEXP_SCALE + controller.rebalancePrecision()).div(UEXP_SCALE);
+    function _emergencyLeverage() internal view returns (uint256) {
+        return targetLeverage.mul(controller.emergencyLeverageThreshold()).div(UEXP_SCALE);
+    }
+
+    function _emergencyMinLeverage() internal view returns (uint256) {
+        return targetLeverage.mul(controller.emergencyRebalanceMinLeverageRate()).div(UEXP_SCALE);
     }
 
     function _sendRebalanceFee(int256 markPrice, int256 tradeAmount) internal {
